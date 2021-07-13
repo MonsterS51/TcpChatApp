@@ -56,8 +56,9 @@ namespace TcpChatApp {
 			Task.Factory.StartNew(() => {
 				while (isRun) {
 					if (swConnOK.ElapsedMilliseconds > 10000) {
+						if (isOnline) Console.WriteLine();	// чтобы не затирать написанное
 						isOnline = false;
-						Program.WriteMsgToConsole($"No connection for {swConnOK.ElapsedMilliseconds/1000}s");
+						Program.WriteMsgToConsoleSameLine($"No connection for {swConnOK.ElapsedMilliseconds / 1000}s");
 					}
 					Thread.Sleep(5000);
 				}
@@ -66,8 +67,8 @@ namespace TcpChatApp {
 			// запускаем отправку CONN_OK на целевой IP
 			Task.Factory.StartNew(() => {
 				while (true) {
-					Program.SendMessage(CONN_OK);
-					Thread.Sleep(5000);
+					Program.SendMessage(CONN_OK, false);
+					Thread.Sleep(2500);
 				};
 			});
 
@@ -76,11 +77,12 @@ namespace TcpChatApp {
 
 		///<summary> Получить текст сообщения из потока. </summary>
 		private string GetMessage(NetworkStream Stream) {
-			byte[] data = new byte[64]; // буфер для получаемых данных
+			if (Stream == null) return string.Empty;
+			byte[] data = new byte[64];	// буфер для получаемых данных
 			StringBuilder builder = new StringBuilder();
 			do {
 				var bytes = Stream.Read(data, 0, data.Length);
-				builder.Append(Encoding.Unicode.GetString(data, 0, bytes));
+				builder.Append(Encoding.UTF8.GetString(data, 0, bytes));
 			}
 			while (Stream.DataAvailable);
 			return builder.ToString();
@@ -91,13 +93,19 @@ namespace TcpChatApp {
 			var msgText = msg;
 
 			// отделяем IP отправившего от сообщения
+			string clientIP = sender;
 			var ipEnd = msgText.IndexOf(' ');
-			var clientIP = msgText.Substring(0, ipEnd);
-			if (clientIP.Contains('.')) {
-				//раз есть точки - похоже на IP
-				msgText = msgText.Remove(0, ipEnd).Trim();
-			} else {
-				clientIP = sender;
+			if (ipEnd > 0) {
+				clientIP = msgText.Substring(0, ipEnd);
+				if (clientIP.Contains('.')) {
+					//раз есть точки - похоже на IP
+					msgText = msgText.Remove(0, ipEnd).Trim();
+				}
+			}
+
+			if (clientIP != Program.IP) {
+				Program.WriteMsgToConsole($"[{DateTime.Now}] [Wrong {clientIP}] : {msg}");
+				return;
 			}
 
 			// проверяем служебные сообщения
@@ -111,7 +119,7 @@ namespace TcpChatApp {
 			}
 
 			if (msgText == CONN_OFF) {
-				if (!isOnline) {
+				if (isOnline) {
 					isOnline = false;
 					Program.WriteMsgToConsole($"[{DateTime.Now}] [{clientIP}] : Connection OFF");
 				}
@@ -119,6 +127,7 @@ namespace TcpChatApp {
 			}
 
 			// просто получили текстовое сообщение
+			if (Program.secKey != null) msgText = CryptHelper.AesDecryptPass(msgText, Encoding.UTF8.GetString(Program.secKey));
 			Program.WriteMsgToConsole($"[{DateTime.Now}] [{clientIP}] : {msgText}");
 			Console.Beep();
 			isOnline = true;
@@ -126,8 +135,10 @@ namespace TcpChatApp {
 
 		///<summary> Остановка сервера. </summary>
 		public void Shootdown() {
-			Program.SendMessage(CONN_OFF);
+			Program.SendMessage(CONN_OFF, false);
 			isRun = false;
+			Thread.Sleep(200);	// даем потокам завершиться
+
 			isOnline = false;
 			tcpClient?.Close();
 			tcpListener = null;
