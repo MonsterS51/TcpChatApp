@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Diagnostics;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -9,140 +10,179 @@ using System.Threading.Tasks;
 namespace TcpChatApp {
 	public class TcpServer {
 
-		public TcpServer() {
+		public TcpServer(IPAddress MyIP, IPAddress TargetIP, int Port = 8888, byte[] SecKey = null) {
+			this.myIP = MyIP;
+			this.targetIP = TargetIP;
+			this.port = Port;
+			this.secKey = Encoding.UTF8.GetString(SecKey);
 			Start();
 		}
 
-		public static string CONN_OK = "CONN_OK";
-		public static string CONN_OFF = "CONN_OFF";
+		private readonly IPAddress myIP;
+		private readonly IPAddress targetIP;
+		private readonly int port;
+		private readonly string secKey;
+
+		public static readonly string CONN_OK = "CONN_OK";
+		public static readonly string CONN_OFF = "CONN_OFF";
 
 		public bool isOnline = false;
 		private TcpListener tcpListener;
-		private TcpClient tcpClient;
-		private Stopwatch swConnOK;
-		private bool isRun = false;
+		private Stopwatch swConnectionPing;
+		private CancellationTokenSource cts;
+
+		private static readonly string noConnMsg = "Waiting for connection";
 
 		///<summary> Запуск сервера. </summary>
 		private void Start() {
-			isRun = true;
-			swConnOK = new Stopwatch();
-			swConnOK.Start();
+			swConnectionPing = new Stopwatch();
+			swConnectionPing.Start();
 
 			// запускаем прослушку TCP
-			tcpListener = new TcpListener(IPAddress.Any, Program.port);
+			tcpListener = new TcpListener(IPAddress.Any, port);
 			tcpListener.Start();
+
+			cts = new CancellationTokenSource();
+			var ct = cts.Token;
 
 			// запускаем поток получения сообщений
 			Task.Factory.StartNew(() => {
-				Console.WriteLine("Waiting for a connection... ");
-				while (isRun) {
-					try {
+				Console.WriteLine(noConnMsg + " ...");
 
-						tcpClient = tcpListener.AcceptTcpClient();
-						var Stream = tcpClient.GetStream();
-						string message = GetMessage(Stream);
-						var IP = $"{((IPEndPoint)tcpClient.Client.RemoteEndPoint).Address}";
-						ProcessMessage(message, IP);
-						tcpClient.Close();
+				while (!ct.IsCancellationRequested) {
+					try {
+						if (tcpListener.Pending()) {
+							using var tcpClient = tcpListener.AcceptTcpClient();
+							using var netStream = tcpClient.GetStream();
+							string message = GetMessage(netStream);
+							var remoteIP = ((IPEndPoint)tcpClient.Client.RemoteEndPoint).Address;
+
+							if (!remoteIP.Equals(targetIP)) {
+								Utils.WriteLineWithSaveInput($"[{DateTime.Now}] [Wrong {remoteIP} in chat!]");
+								return;
+							}
+
+							ProcessIncomeMessage(message, remoteIP);
+						}
 					} catch (Exception ex) {
-						Console.WriteLine(ex);
-						tcpClient?.Close();
+						Console.WriteLine(ex.Message);
 					}
+					Thread.Sleep(100);
 				}
 
-			});
+			}, ct);
 
 			// запуск мониторинга подключения
 			Task.Factory.StartNew(() => {
-				while (isRun) {
-					if (swConnOK.ElapsedMilliseconds > 10000) {
-						if (isOnline) Console.WriteLine();	// чтобы не затирать написанное
+				while (!ct.IsCancellationRequested) {
+					if (swConnectionPing.ElapsedMilliseconds > 10000) {
+						if (isOnline) Console.WriteLine();  // чтобы не затирать написанное
 						isOnline = false;
-						Program.WriteMsgToConsoleSameLine($"No connection for {swConnOK.ElapsedMilliseconds / 1000}s");
+						Utils.WriteLineWithReplace($"{noConnMsg} ({swConnectionPing.ElapsedMilliseconds / 1000}s)");
 					}
 					Thread.Sleep(5000);
 				}
-			});
+			}, ct);
 
 			// запускаем отправку CONN_OK на целевой IP
 			Task.Factory.StartNew(() => {
-				while (true) {
-					Program.SendMessage(CONN_OK, false);
-					Thread.Sleep(2500);
+				while (!ct.IsCancellationRequested) {
+					var sended = SendMessage(CONN_OK, false);
+					if (!sended) Utils.WriteLineWithReplace("Failed send CONN_OK msg :(");
+					Thread.Sleep(2000);
 				};
-			});
+			}, ct);
 
 		}
 
 
 		///<summary> Получить текст сообщения из потока. </summary>
-		private string GetMessage(NetworkStream Stream) {
+		private static string GetMessage(NetworkStream Stream) {
 			if (Stream == null) return string.Empty;
-			byte[] data = new byte[64];	// буфер для получаемых данных
-			StringBuilder builder = new StringBuilder();
-			do {
-				var bytes = Stream.Read(data, 0, data.Length);
-				builder.Append(Encoding.UTF8.GetString(data, 0, bytes));
+			byte[] data = new byte[64];
+			using var ms = new MemoryStream();
+			int numBytesRead;
+			while ((numBytesRead = Stream.Read(data, 0, data.Length)) > 0) {
+				ms.Write(data, 0, numBytesRead);
 			}
-			while (Stream.DataAvailable);
-			return builder.ToString();
+			var str = Encoding.UTF8.GetString(ms.ToArray(), 0, (int)ms.Length);
+			return str;
 		}
 
-		///<summary> Обработка сообщения. </summary>
-		private void ProcessMessage(string msg, string sender) {
-			var msgText = msg;
-
-			// отделяем IP отправившего от сообщения
-			string clientIP = sender;
-			var ipEnd = msgText.IndexOf(' ');
-			if (ipEnd > 0) {
-				clientIP = msgText.Substring(0, ipEnd);
-				if (clientIP.Contains('.')) {
-					//раз есть точки - похоже на IP
-					msgText = msgText.Remove(0, ipEnd).Trim();
-				}
-			}
-
-			if (clientIP != Program.IP) {
-				Program.WriteMsgToConsole($"[{DateTime.Now}] [Wrong {clientIP}] : {msg}");
-				return;
-			}
+		///<summary> Обработка входящего сообщения. </summary>
+		private void ProcessIncomeMessage(string msg, IPAddress remoteIP) {
+			var msgText = msg.Trim();
 
 			// проверяем служебные сообщения
 			if (msgText == CONN_OK) {
 				if (!isOnline) {
 					isOnline = true;
-					Program.WriteMsgToConsole($"[{DateTime.Now}] [{clientIP}] : Connection OK");
+					Utils.WriteLineWithSaveInput();
+					Utils.WriteLineWithSaveInput($"[{DateTime.Now}] [{remoteIP}] : Connection OK");
 				}
-				swConnOK.Restart();
+				swConnectionPing.Restart();
 				return;
 			}
 
 			if (msgText == CONN_OFF) {
 				if (isOnline) {
 					isOnline = false;
-					Program.WriteMsgToConsole($"[{DateTime.Now}] [{clientIP}] : Connection OFF");
+					Utils.WriteLineWithSaveInput($"[{DateTime.Now}] [{remoteIP}] : Connection OFF");
+					Utils.WriteLineWithSaveInput();
 				}
 				return;
 			}
 
 			// просто получили текстовое сообщение
-			if (Program.secKey != null) msgText = CryptHelper.AesDecryptPass(msgText, Encoding.UTF8.GetString(Program.secKey));
-			Program.WriteMsgToConsole($"[{DateTime.Now}] [{clientIP}] : {msgText}");
+			try {
+				if (!string.IsNullOrWhiteSpace(secKey)) {
+					msgText = CryptHelper.AesDecryptPass(msgText, secKey);
+				}
+			} catch (Exception ex) {
+				Utils.WriteLineWithSaveInput($"[{DateTime.Now}] Failed decrypt: {ex.Message}");
+			}
+
+			Utils.WriteLineWithSaveInput($"[{DateTime.Now}] >>>: {msgText}");
 			Console.Beep();
 			isOnline = true;
 		}
 
+
+		///<summary> Отправка сообщения. </summary>
+		public bool SendMessage(string message, bool useEncr = true) {
+			if (string.IsNullOrWhiteSpace(message)) return false;
+
+			var encrMsg = message;
+
+			if (useEncr && !string.IsNullOrWhiteSpace(secKey)) { 
+				encrMsg = CryptHelper.AesEncryptPass(message, secKey); 
+			}
+			var data = Encoding.UTF8.GetBytes(encrMsg);
+
+			try {
+				using var tcpClient = new TcpClient();
+				tcpClient.Connect(targetIP, port);
+				using var netStream = tcpClient.GetStream();
+				netStream.Write(data);
+			} catch (SocketException) {
+				// давим сообщение об отсутствии ответа
+				return false;
+			} catch (Exception ex) {
+				Console.WriteLine(ex.Message);
+				return false;
+			}
+
+			return true;
+		}
+
 		///<summary> Остановка сервера. </summary>
 		public void Shootdown() {
-			Program.SendMessage(CONN_OFF, false);
-			isRun = false;
-			Thread.Sleep(200);	// даем потокам завершиться
-
+			SendMessage(CONN_OFF, false);
+			cts.Cancel();
+			cts.Dispose();
 			isOnline = false;
-			tcpClient?.Close();
 			tcpListener = null;
-			swConnOK.Stop();
+			swConnectionPing.Stop();
 		}
 
 	}
